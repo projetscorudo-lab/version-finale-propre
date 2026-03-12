@@ -1,76 +1,12 @@
-:root {
-  --bg:#f5f7fb;
-  --panel:#ffffff;
-  --border:#d7dde7;
-  --text:#17212f;
-  --muted:#637083;
-  --primary:#1f6feb;
-  --danger:#d1242f;
-}
-*{box-sizing:border-box}
-body{margin:0;font-family:Inter,system-ui,Arial,sans-serif;background:var(--bg);color:var(--text)}
-button,input,select,textarea{font:inherit}
-.app-shell{max-width:1500px;margin:0 auto;padding:20px}
-.topbar{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:20px}
-.topbar h1{margin:0 0 8px;font-size:32px}
-.topbar p{margin:0;color:var(--muted)}
-.actions{display:flex;gap:8px;flex-wrap:wrap}
-.btn{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);background:#fff;border-radius:12px;padding:10px 14px;cursor:pointer;text-decoration:none;color:var(--text)}
-.btn.primary{background:var(--primary);border-color:var(--primary);color:white}
-.btn.danger{background:#fff5f5;border-color:#f2b9bd;color:var(--danger)}
-.btn.small{padding:6px 10px;font-size:13px}
-.btn:disabled{opacity:.5;cursor:not-allowed}
-.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:20px}
-.kpi{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px}
-.kpi-label{color:var(--muted);font-size:14px}
-.kpi-value{font-size:30px;font-weight:700;margin-top:4px}
-.tabs{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin-bottom:16px}
-.tab{padding:12px;border:1px solid var(--border);border-radius:14px;background:white;cursor:pointer}
-.tab.active{background:#e8f0ff;border-color:#b9cdfc;font-weight:600}
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:18px;padding:16px}
-.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.panel-head h3{margin:0;font-size:20px}
-.grid-2{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}
-.grid-bcs{display:grid;grid-template-columns:360px 1fr;gap:16px}
-.stack{display:flex;flex-direction:column;gap:12px}
-.box{border:1px solid var(--border);border-radius:14px;padding:12px;background:#fbfcff}
-.label{display:block;margin-bottom:6px;font-weight:600}
-.input,.textarea,select.input{width:100%;padding:9px 10px;border:1px solid var(--border);border-radius:10px;background:white}
-.textarea{min-height:120px;resize:vertical}
-.form-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.table-wrap{overflow:auto;border:1px solid var(--border);border-radius:14px;background:white}
-table{width:100%;border-collapse:collapse}
-th,td{padding:10px;border-bottom:1px solid #edf1f6;vertical-align:top;text-align:left;font-size:14px}
-thead th{background:#f8fafc;position:sticky;top:0;z-index:1}
-.muted{color:var(--muted);font-size:13px}
-.row-between{display:flex;justify-content:space-between;gap:12px}
-.alert-box{border:1px solid var(--border);border-radius:14px;padding:12px;background:#fff}
-.empty{padding:20px;text-align:center;color:var(--muted);border:1px dashed var(--border);border-radius:14px;background:white}
-.badge{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:700}
-.badge.green{background:#e9f8ef;color:#157347}
-.badge.orange{background:#fff4dd;color:#a16207}
-.badge.red{background:#ffe3e5;color:#b42318}
-.badge.gray{background:#edf2f7;color:#475467}
-.list-scroll{max-height:520px;overflow:auto;display:flex;flex-direction:column;gap:8px}
-.list-item{border:1px solid var(--border);border-radius:14px;background:white;padding:12px;text-align:left;cursor:pointer}
-.list-item.selected{background:#eef4ff;border-color:#b9cdfc}
-.search-row{max-width:480px;margin-bottom:12px}
-.mini-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.mini-kpi{border:1px solid var(--border);border-radius:14px;background:white;padding:12px}
-.info{background:#eef4ff;border:1px solid #c9d9ff;border-radius:14px;padding:12px}
-.checkbox-line{display:flex;align-items:center;gap:8px}
-ul{margin:8px 0 0 18px;padding:0}
-@media (max-width: 1100px){
-  .kpis{grid-template-columns:repeat(3,1fr)}
-  .tabs{grid-template-columns:repeat(3,1fr)}
-  .grid-2,.grid-bcs{grid-template-columns:1fr}
-  .form-grid{grid-template-columns:repeat(2,1fr)}
-  .mini-kpis{grid-template-columns:repeat(2,1fr)}
-}
-@media (max-width: 700px){
-  .topbar{flex-direction:column}
-  .kpis{grid-template-columns:repeat(2,1fr)}
-  .tabs{grid-template-columns:repeat(2,1fr)}
-  .form-grid{grid-template-columns:1fr}
-  .mini-kpis{grid-template-columns:1fr}
-}
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Suivi des bons de commande</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
