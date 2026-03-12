@@ -1,0 +1,1332 @@
+import React, { useEffect, useMemo, useState } from "react";
+import * as XLSX from "xlsx";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+
+const STORAGE_KEY = "suivi-bdc-app-v4";
+
+function uid() {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+}
+
+function normalizeText(v) {
+  return String(v || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeBC(v) {
+  let txt = normalizeText(v).replace(/\s*-\s*/g, "-");
+  if (!txt || txt === "-" || txt === "0") return "";
+  if (txt.includes("*")) return "";
+  txt = txt.replace(/^BC\s+/, "BC");
+  txt = txt.replace(/\s+AGRI\s+/g, "-AGRI-");
+  txt = txt.replace(/-AGRI\s+/g, "-AGRI-");
+  txt = txt.replace(/\s+AGRI-/g, "-AGRI-");
+  return txt;
+}
+
+function normalizeCode(v) {
+  return normalizeText(v).replace(/\s+/g, "");
+}
+
+function normalizeUnit(v) {
+  const t = normalizeText(v);
+  if (["FOR", "FORFAIT", "F", "U"].includes(t)) return "FOR";
+  if (["T", "TONNE", "TONNES"].includes(t)) return "T";
+  return t;
+}
+
+function isPrestationUnit(v) {
+  return normalizeUnit(v) === "FOR";
+}
+
+function parseNumber(v) {
+  if (typeof v === "number" && !Number.isNaN(v)) return v;
+  let s = String(v ?? "").trim();
+  if (!s) return 0;
+  s = s.replace(/€/g, "").replace(/\u00A0/g, " ").replace(/\s/g, "");
+  if (s.includes(",") && s.includes(".")) s = s.replace(/\./g, "").replace(/,/g, ".");
+  else if (s.includes(",")) s = s.replace(/,/g, ".");
+  const n = Number(s);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function excelDateToIso(value) {
+  if (value === null || value === undefined || value === "") return "";
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  if (typeof value === "number") {
+    const d = XLSX.SSF.parse_date_code(value);
+    if (d && d.y) return new Date(Date.UTC(d.y, d.m - 1, d.d)).toISOString().slice(0, 10);
+    return "";
+  }
+  const s = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const fr = s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+  if (fr) {
+    let year = Number(fr[3]);
+    if (year < 100) year += 2000;
+    return new Date(Date.UTC(year, Number(fr[2]) - 1, Number(fr[1]))).toISOString().slice(0, 10);
+  }
+  return "";
+}
+
+function formatDate(v) {
+  if (!v) return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(v))) {
+    const [y, m, d] = String(v).split("-");
+    return `${d}/${m}/${y}`;
+  }
+  return String(v);
+}
+
+function formatNumber(v) {
+  return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 2 }).format(Number(v || 0));
+}
+
+function formatCurrency(v) {
+  return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(Number(v || 0));
+}
+
+function isValdelia(text) {
+  return normalizeText(text).includes("VALDELIA");
+}
+
+const defaultMappings = [
+  { uid: uid(), keyword: "DIB", code: "1.3", libelleReference: "Dechets industriels banals (DIB)", unite: "t", active: true },
+  { uid: uid(), keyword: "DIB APPORT", code: "1.3", libelleReference: "Dechets industriels banals (DIB)", unite: "t", active: true },
+  { uid: uid(), keyword: "PNEUS", code: "1.5", libelleReference: "Pneus avec ou sans jantes", unite: "t", active: true },
+  { uid: uid(), keyword: "PNEUS APPORT", code: "1.5", libelleReference: "Pneus avec ou sans jantes", unite: "t", active: true },
+  { uid: uid(), keyword: "DECHETS VERTS", code: "1.20", libelleReference: "Dechets verts", unite: "t", active: true },
+  { uid: uid(), keyword: "DEPOT POLY 30MCUBE", code: "2.3.1", libelleReference: "Bennes de 20.1 à 30m3, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "ROTATION POLY 30MCUBE", code: "2.3.1", libelleReference: "Bennes de 20.1 à 30m3, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "RETRAIT POLY 30MCUBE", code: "2.3.1", libelleReference: "Bennes de 20.1 à 30m3, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "CHARGEMENT IMMEDIAT POLY 30MCUBE", code: "2.3.1", libelleReference: "Bennes de 20.1 à 30m3, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "PASSAGE A VIDE POLY 30MCUBE", code: "2.3.1", libelleReference: "Bennes de 20.1 à 30m3, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "ANNULATION DE COMMANDE POLY 30MCUBE", code: "2.3.1", libelleReference: "Bennes de 20.1 à 30m3, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "DEPOT POLY 15MCUBE", code: "2.2.1", libelleReference: "Bennes de 15.1 à 20m3 ouvertes, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "ROTATION POLY 15MCUBE", code: "2.2.1", libelleReference: "Bennes de 15.1 à 20m3 ouvertes, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "ROTATION POLY FERMEE 15MCUBE", code: "2.2.1", libelleReference: "Bennes de 15.1 à 20m3 ouvertes, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "RETRAIT POLY 15MCUBE", code: "2.2.1", libelleReference: "Bennes de 15.1 à 20m3 ouvertes, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "DEPOT POLY 10MCUBE", code: "2.1.1", libelleReference: "Bennes de 10.1 à 13m3, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "ROTATION POLY 10MCUBE", code: "2.1.1", libelleReference: "Bennes de 10.1 à 13m3, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "RETRAIT POLY 10MCUBE", code: "2.1.1", libelleReference: "Bennes de 10.1 à 13m3, duree inferieure ou egale a un mois", unite: "for", active: true },
+  { uid: uid(), keyword: "BOIS B", code: "1.16", libelleReference: "Bois B (glissieres bois)", unite: "t", active: true },
+];
+
+const defaultState = {
+  version: 4,
+  bcs: [],
+  importRows: [],
+  mappings: defaultMappings,
+  params: { alertThreshold: 0.9, daysBeforeEnd: 15, excludeValdelia: true },
+};
+
+function hydrateBcLine(line) {
+  return {
+    uid: line.uid || uid(),
+    code: line.code || "",
+    libelle: line.libelle || "",
+    libelleReference: line.libelleReference || "",
+    unite: line.unite || "",
+    qtePrevue: parseNumber(line.qtePrevue),
+    prix: parseNumber(line.prix),
+    montant: parseNumber(line.montant || parseNumber(line.qtePrevue) * parseNumber(line.prix)),
+  };
+}
+
+function hydrateBc(bc) {
+  return {
+    uid: bc.uid || uid(),
+    id: normalizeBC(bc.id),
+    emission: excelDateToIso(bc.emission),
+    debut: excelDateToIso(bc.debut),
+    fin: excelDateToIso(bc.fin),
+    lieu: bc.lieu || "",
+    sourceName: bc.sourceName || "",
+    rawText: bc.rawText || "",
+    lines: (bc.lines || []).map(hydrateBcLine),
+  };
+}
+
+function hydrateImportRow(row) {
+  return {
+    uid: row.uid || uid(),
+    date: excelDateToIso(row.date),
+    numBon: row.numBon || "",
+    numBonManuelBrut: row.numBonManuelBrut || "",
+    bcValide: normalizeBC(row.bcValide || row.numBonManuelBrut),
+    description: row.description || "",
+    codeAuto: row.codeAuto || "",
+    libelleReferenceAuto: row.libelleReferenceAuto || "",
+    unite: row.unite || "",
+    quantite: parseNumber(row.quantite),
+    montant: parseNumber(row.montant),
+    chantier: row.chantier || "",
+    exutoire: row.exutoire || "",
+    chantierExutoire: row.chantierExutoire || [row.chantier, row.exutoire].filter(Boolean).join(" | "),
+    simulationBc: row.simulationBc || "",
+    simulationCode: row.simulationCode || row.codeAuto || "",
+    assignedBc: normalizeBC(row.assignedBc),
+    assignedCode: row.assignedCode || "",
+  };
+}
+
+function safeReadLocal() {
+  if (typeof window === "undefined") return defaultState;
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return defaultState;
+    const parsed = JSON.parse(raw);
+    return {
+      version: 4,
+      bcs: (parsed.bcs || []).map(hydrateBc),
+      importRows: (parsed.importRows || []).map(hydrateImportRow),
+      mappings: (parsed.mappings?.length ? parsed.mappings : defaultMappings).map((m) => ({
+        uid: m.uid || uid(),
+        keyword: m.keyword || "",
+        code: m.code || "",
+        libelleReference: m.libelleReference || "",
+        unite: m.unite || "",
+        active: m.active !== false,
+      })),
+      params: {
+        alertThreshold: parseNumber(parsed.params?.alertThreshold) || defaultState.params.alertThreshold,
+        daysBeforeEnd: Math.max(0, Math.round(parseNumber(parsed.params?.daysBeforeEnd) || defaultState.params.daysBeforeEnd)),
+        excludeValdelia: parsed.params?.excludeValdelia !== false,
+      },
+    };
+  } catch {
+    return defaultState;
+  }
+}
+
+function persistState(state) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    version: 4,
+    bcs: state.bcs,
+    importRows: state.importRows,
+    mappings: state.mappings,
+    params: state.params,
+  }));
+}
+
+function findBestMapping(description, mappings) {
+  const desc = normalizeText(description);
+  if (!desc) return { code: "", unite: "", libelleReference: "" };
+  const exact = mappings.find((m) => m.active && normalizeText(m.keyword) === desc);
+  if (exact) return { code: exact.code, unite: exact.unite, libelleReference: exact.libelleReference };
+  const contains = mappings.find((m) => m.active && desc.includes(normalizeText(m.keyword)));
+  if (contains) return { code: contains.code, unite: contains.unite, libelleReference: contains.libelleReference };
+  return { code: "", unite: "", libelleReference: "" };
+}
+
+function getResolvedBcLine(line, mappings) {
+  const mapping = findBestMapping(line.libelleReference || line.libelle, mappings);
+  return {
+    code: line.code || mapping.code,
+    unite: line.unite || mapping.unite,
+    libelleReference: line.libelleReference || mapping.libelleReference || line.libelle,
+  };
+}
+
+function sameLineNature(aUnit, bUnit) {
+  return normalizeUnit(aUnit) === normalizeUnit(bUnit);
+}
+
+function statusFromValues(realized, planned, endDate, params) {
+  if (!planned || planned <= 0) return realized > 0 ? "DEPASSE" : "OK";
+  if (realized > planned) return "DEPASSE";
+  if (realized >= planned * params.alertThreshold) return "A SURVEILLER";
+  if (endDate) {
+    const end = new Date(`${endDate}T00:00:00`);
+    if (!Number.isNaN(end.getTime())) {
+      const diffDays = Math.ceil((end.getTime() - Date.now()) / 86400000);
+      if (diffDays < 0) return "TERMINE";
+      if (diffDays <= params.daysBeforeEnd) return "ECHEANCE PROCHE";
+    }
+  }
+  return "OK";
+}
+
+function findColumn(headers, aliases) {
+  const list = headers.map((h) => ({ raw: h, n: normalizeText(h) }));
+  for (const alias of aliases) {
+    const a = normalizeText(alias);
+    const exact = list.find((h) => h.n === a);
+    if (exact) return exact.raw;
+  }
+  for (const alias of aliases) {
+    const a = normalizeText(alias);
+    const hit = list.find((h) => h.n.includes(a) || a.includes(h.n));
+    if (hit) return hit.raw;
+  }
+  return null;
+}
+
+function buildImportRows(rows, mappings) {
+  if (!rows.length) return [];
+  const headers = Object.keys(rows[0]);
+  const cDate = findColumn(headers, ["DATE"]);
+  const cNumBon = findColumn(headers, ["NUM BON", "NUMERO BON", "N BON"]);
+  const cNumBonManuel = findColumn(headers, ["NUM BON MANUEL", "NUMERO BON MANUEL", "BON MANUEL"]);
+  const cDesc = findColumn(headers, ["DESCRIPTION", "LIBELLE", "DESIGNATION"]);
+  const cChantier = findColumn(headers, ["NCHANTIER", "CHANTIER", "N CHANTIER"]);
+  const cExutoire = findColumn(headers, ["EXUTOIRE"]);
+  const cQte = findColumn(headers, ["QUANTITELIGNE", "QUANTITE LIGNE", "QUANTITE", "QTE", "QTE LIGNE"]);
+  const cMontant = findColumn(headers, ["MONTANTHTLIGNE", "MONTANT HT LIGNE", "MONTANT HT", "MONTANT"]);
+
+  return rows
+    .map((r) => {
+      const description = String(r[cDesc] ?? "").trim();
+      const rawManual = String(r[cNumBonManuel] ?? "").trim();
+      const bcValide = normalizeBC(rawManual);
+      const chantier = String(r[cChantier] ?? "").trim();
+      const exutoire = String(r[cExutoire] ?? "").trim();
+      const map = findBestMapping(description, mappings);
+      return hydrateImportRow({
+        date: excelDateToIso(r[cDate]),
+        numBon: String(r[cNumBon] ?? "").trim(),
+        numBonManuelBrut: rawManual,
+        bcValide,
+        description,
+        codeAuto: map.code,
+        libelleReferenceAuto: map.libelleReference,
+        unite: map.unite,
+        quantite: parseNumber(r[cQte]),
+        montant: parseNumber(r[cMontant]),
+        chantier,
+        exutoire,
+        chantierExutoire: [chantier, exutoire].filter(Boolean).join(" | "),
+        simulationBc: "",
+        simulationCode: map.code,
+        assignedBc: "",
+        assignedCode: "",
+      });
+    })
+    .filter((r) => r.description || r.numBonManuelBrut || r.quantite || r.montant);
+}
+
+function groupPdfLines(items) {
+  const sorted = [...items].sort((a, b) => {
+    const ay = a.transform?.[5] ?? 0;
+    const by = b.transform?.[5] ?? 0;
+    if (Math.abs(by - ay) > 2) return by - ay;
+    return (a.transform?.[4] ?? 0) - (b.transform?.[4] ?? 0);
+  });
+  const lines = [];
+  let current = [];
+  let currentY = null;
+  for (const item of sorted) {
+    const y = item.transform?.[5] ?? 0;
+    if (currentY === null || Math.abs(y - currentY) <= 2) {
+      current.push(item.str);
+      currentY = currentY === null ? y : currentY;
+    } else {
+      lines.push(current.join(" ").replace(/\s+/g, " ").trim());
+      current = [item.str];
+      currentY = y;
+    }
+  }
+  if (current.length) lines.push(current.join(" ").replace(/\s+/g, " ").trim());
+  return lines.filter(Boolean);
+}
+
+async function extractPdfText(file) {
+  const data = new Uint8Array(await file.arrayBuffer());
+  const pdf = await pdfjsLib.getDocument({ data, disableWorker: true }).promise;
+  const allLines = [];
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const textContent = await page.getTextContent();
+    allLines.push(...groupPdfLines(textContent.items || []));
+  }
+  return allLines.join("\n");
+}
+
+function parsePdfToBc(text, fileName, mappings) {
+  const fileBase = String(fileName || "").replace(/\.pdf$/i, "");
+  const bcFromFile = fileBase.match(/(BC\s*\d{2}[A-Z0-9\- ]+)/i)?.[1] || "";
+  const bcFromText = text.match(/(BC\s*\d{2}[A-Z0-9\- ]+)/i)?.[1] || "";
+  const range = text.match(/du\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\s*au\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})/i) || fileBase.match(/du\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\s*au\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})/i);
+  const emissionMatch = text.match(/(DATE D[’' ]EMISSION|EMISSION|EMIS LE)\s*:?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})/i);
+  const dateMatches = [...text.matchAll(/(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})/g)].map((m) => m[1]);
+  const lieuText = text.match(/LIEU D[’' ]EXECUTION\s*:?\s*(.+)/i)?.[1] || "";
+  const lieuFile = fileBase.match(/BC\d{2}-([^\-]+)-AGRI/i)?.[1] || "";
+  const lines = text.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  const parsedLines = [];
+  const skipWords = ["DESIGNATION", "LIBELLE", "MONTANT", "PRIX", "TOTAL", "BON DE COMMANDE", "DATE", "ADRESSE", "LIEU D EXECUTION"];
+
+  for (const line of lines) {
+    const n = normalizeText(line);
+    if (skipWords.some((w) => n.includes(w) && n.length < 60)) continue;
+    const numeric = line.match(/-?\d+(?:[.,]\d+)?/g);
+    if (!numeric || numeric.length < 3) continue;
+    const amountRaw = numeric[numeric.length - 1];
+    const priceRaw = numeric[numeric.length - 2];
+    const qtyRaw = numeric[numeric.length - 3];
+    const idx = line.indexOf(qtyRaw);
+    const label = (idx > 0 ? line.slice(0, idx) : line).replace(/\s+/g, " ").trim();
+    if (!label || label.length < 4) continue;
+    if (parsedLines.some((l) => normalizeText(l.libelle) === normalizeText(label))) continue;
+    const map = findBestMapping(label, mappings);
+    parsedLines.push(hydrateBcLine({ code: map.code, libelle: label, libelleReference: map.libelleReference, unite: map.unite, qtePrevue: parseNumber(qtyRaw), prix: parseNumber(priceRaw), montant: parseNumber(amountRaw) }));
+  }
+
+  return hydrateBc({
+    id: normalizeBC(bcFromFile || bcFromText || fileBase),
+    emission: excelDateToIso(emissionMatch?.[2] || dateMatches[0] || ""),
+    debut: excelDateToIso(range?.[1] || ""),
+    fin: excelDateToIso(range?.[2] || ""),
+    lieu: String(lieuText || lieuFile).replace(/\s+/g, " ").trim(),
+    sourceName: fileName,
+    rawText: text,
+    lines: parsedLines.length ? parsedLines : [hydrateBcLine({})],
+  });
+}
+
+function exportWorkbook(state, compareLines, compareByBc, rowsWithoutBc, simulationRows) {
+  const wb = XLSX.utils.book_new();
+
+  const bcHeaders = state.bcs.map((bc) => ({
+    BC: bc.id,
+    Date_emission: bc.emission,
+    Date_debut: bc.debut,
+    Date_fin: bc.fin,
+    Lieu: bc.lieu,
+    Source: bc.sourceName || "",
+  }));
+
+  const bcLines = state.bcs.flatMap((bc) =>
+    bc.lines.map((line) => ({
+      BC: bc.id,
+      Code: line.code,
+      Libelle: line.libelle,
+      Libelle_reference: line.libelleReference,
+      Unite: line.unite,
+      Quantite_prevue: line.qtePrevue,
+      Prix: line.prix,
+      Montant: line.montant,
+    }))
+  );
+
+  const imports = state.importRows.map((r) => ({
+    Date: r.date,
+    Num_Bon: r.numBon,
+    Num_Bon_Manuel_Brut: r.numBonManuelBrut,
+    BC_Valide: r.bcValide,
+    Description: r.description,
+    Code_auto: r.codeAuto,
+    Libelle_reference_auto: r.libelleReferenceAuto,
+    Unite: r.unite,
+    Quantite: r.quantite,
+    Montant_HT: r.montant,
+    Chantier: r.chantier,
+    Exutoire: r.exutoire,
+    Chantier_Exutoire: r.chantierExutoire,
+    Simulation_BC: r.simulationBc,
+    Simulation_Code: r.simulationCode,
+    Affectation_BC: r.assignedBc,
+    Affectation_Code: r.assignedCode,
+  }));
+
+  const sansBc = rowsWithoutBc.map((r) => ({
+    Date: r.date,
+    Description: r.description,
+    Code_auto: r.codeAuto,
+    Unite: r.unite,
+    Quantite: r.quantite,
+    Montant: r.montant,
+    Chantier: r.chantier,
+    Exutoire: r.exutoire,
+    BC_simule: r.simulationBc,
+    Code_simule: r.simulationCode,
+    Affectation_BC: r.assignedBc,
+    Affectation_Code: r.assignedCode,
+  }));
+
+  const simulation = simulationRows.map(({ row, targetLine, planned, already, after, status }) => ({
+    Date: row.date,
+    Description: row.description,
+    BC_simule: row.simulationBc,
+    Code_simule: row.simulationCode,
+    Quantite: row.quantite,
+    Unite: row.unite,
+    Qte_prevue_BC: planned,
+    Qte_deja_realisee: already,
+    Qte_apres_affectation: after,
+    Statut: status,
+    Ligne_cible: targetLine?.libelle || "",
+  }));
+
+  const compareLinesExport = compareLines.map((l) => ({
+    BC: l.bc,
+    Lieu: l.lieu,
+    Date_fin: l.fin,
+    Code: l.code,
+    Libelle: l.libelle,
+    Libelle_reference: l.libelleReference,
+    Unite: l.unite,
+    Quantite_prevue: l.plannedQty,
+    Quantite_realisee: l.realizedQty,
+    Reste: l.remainingQty,
+    Montant_prevu: l.plannedAmount,
+    Montant_realise: l.realizedAmount,
+    Statut: l.status,
+  }));
+
+  const compareByBcExport = compareByBc.map((b) => ({
+    BC: b.id,
+    Date_debut: b.debut,
+    Date_fin: b.fin,
+    Lieu: b.lieu,
+    Quantite_prevue: b.plannedQty,
+    Quantite_realisee: b.realizedQty,
+    Statut: b.status,
+  }));
+
+  const mappingsExport = state.mappings.map((m) => ({
+    Libelle_logiciel: m.keyword,
+    Code_correspondance: m.code,
+    Libelle_BC_reference: m.libelleReference,
+    Unite: m.unite,
+    Actif: m.active ? "Oui" : "Non",
+  }));
+
+  const paramsExport = [
+    { Parametre: "Seuil_alerte", Valeur: state.params.alertThreshold },
+    { Parametre: "Jours_avant_fin", Valeur: state.params.daysBeforeEnd },
+    { Parametre: "Exclure_Valdelia", Valeur: state.params.excludeValdelia ? "Oui" : "Non" },
+  ];
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(bcHeaders), "BC_Entetes");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(bcLines), "BC_Lignes");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(imports), "Import_Metier");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(sansBc), "Lignes_Sans_BC");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(simulation), "Simulation_Affectation");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(compareLinesExport), "Comparatif_Lignes");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(compareByBcExport), "Comparatif_BC");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(mappingsExport), "Correspondance");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(paramsExport), "Parametres");
+  XLSX.writeFile(wb, "suivi_bdc_export_complet.xlsx");
+}
+
+function kpiClass(status) {
+  if (status === "DEPASSE" || status === "DEPASSERA") return "badge red";
+  if (status === "A SURVEILLER" || status === "ECHEANCE PROCHE") return "badge orange";
+  if (status === "TERMINE") return "badge gray";
+  return "badge green";
+}
+
+function Panel({ title, children, actions }) {
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h3>{title}</h3>
+        {actions ? <div className="actions">{actions}</div> : null}
+      </div>
+      <div>{children}</div>
+    </div>
+  );
+}
+
+export default function App() {
+  const boot = safeReadLocal();
+  const [bcs, setBcs] = useState(boot.bcs);
+  const [importRows, setImportRows] = useState(boot.importRows);
+  const [mappings, setMappings] = useState(boot.mappings);
+  const [params, setParams] = useState(boot.params);
+  const [selectedBcUid, setSelectedBcUid] = useState(boot.bcs[0]?.uid || null);
+  const [activeTab, setActiveTab] = useState("dashboard");
+  const [searchCompare, setSearchCompare] = useState("");
+  const [searchBc, setSearchBc] = useState("");
+  const [searchImport, setSearchImport] = useState("");
+  const [searchSansBc, setSearchSansBc] = useState("");
+  const [parsingPdf, setParsingPdf] = useState(false);
+  const [xlsInfo, setXlsInfo] = useState("");
+  const [rawPasteText, setRawPasteText] = useState("");
+
+  useEffect(() => {
+    persistState({ bcs, importRows, mappings, params });
+  }, [bcs, importRows, mappings, params]);
+
+  useEffect(() => {
+    if (!selectedBcUid && bcs.length) setSelectedBcUid(bcs[0].uid);
+    if (selectedBcUid && !bcs.some((b) => b.uid === selectedBcUid) && bcs.length) setSelectedBcUid(bcs[0].uid);
+  }, [bcs, selectedBcUid]);
+
+  const effectiveImportRows = useMemo(
+    () => importRows.map((r) => ({ ...r, effectiveBc: r.assignedBc || r.bcValide, effectiveCode: r.assignedCode || r.codeAuto })),
+    [importRows]
+  );
+
+  const rowsWithoutBc = useMemo(
+    () =>
+      importRows.filter((r) => {
+        const invalid = !r.bcValide && !r.assignedBc;
+        if (!invalid) return false;
+        if (params.excludeValdelia && isValdelia(r.chantierExutoire)) return false;
+        return true;
+      }),
+    [importRows, params.excludeValdelia]
+  );
+
+  const compareLines = useMemo(() => {
+    return bcs.flatMap((bc) =>
+      bc.lines.map((line) => {
+        const resolved = getResolvedBcLine(line, mappings);
+        const lineCode = normalizeCode(resolved.code);
+        const lineReference = normalizeText(resolved.libelleReference || line.libelle);
+        const lineLibelle = normalizeText(line.libelle);
+        const lineUnit = resolved.unite || line.unite;
+
+        const matching = effectiveImportRows.filter((r) => {
+          if (normalizeBC(r.effectiveBc) !== normalizeBC(bc.id)) return false;
+          if (!sameLineNature(r.unite, lineUnit)) return false;
+          const rowCode = normalizeCode(r.effectiveCode || r.codeAuto);
+          const rowRef = normalizeText(r.libelleReferenceAuto || "");
+          const rowDesc = normalizeText(r.description);
+
+          if (lineCode && rowCode) return rowCode === lineCode;
+          if (lineCode && !rowCode) return false;
+          if (rowRef && lineReference) return rowRef === lineReference;
+          return rowDesc === lineReference || rowDesc === lineLibelle;
+        });
+
+        const realized = matching.reduce((sum, r) => sum + parseNumber(r.quantite), 0);
+        return {
+          bcUid: bc.uid,
+          bc: bc.id,
+          lieu: bc.lieu,
+          debut: bc.debut,
+          fin: bc.fin,
+          code: resolved.code,
+          libelle: line.libelle,
+          libelleReference: resolved.libelleReference,
+          unite: lineUnit,
+          plannedQty: parseNumber(line.qtePrevue),
+          realizedQty: realized,
+          remainingQty: parseNumber(line.qtePrevue) - realized,
+          plannedAmount: parseNumber(line.qtePrevue) * parseNumber(line.prix),
+          realizedAmount: realized * parseNumber(line.prix),
+          status: statusFromValues(realized, parseNumber(line.qtePrevue), bc.fin, params),
+        };
+      })
+    );
+  }, [bcs, effectiveImportRows, mappings, params]);
+
+  const compareByBc = useMemo(
+    () =>
+      bcs.map((bc) => {
+        const lines = compareLines.filter((l) => l.bcUid === bc.uid);
+        const plannedQty = lines.reduce((s, l) => s + l.plannedQty, 0);
+        const realizedQty = lines.reduce((s, l) => s + l.realizedQty, 0);
+        const status = lines.some((l) => l.status === "DEPASSE")
+          ? "DEPASSE"
+          : lines.some((l) => l.status === "A SURVEILLER")
+          ? "A SURVEILLER"
+          : statusFromValues(realizedQty, plannedQty, bc.fin, params);
+        return { uid: bc.uid, id: bc.id, debut: bc.debut, fin: bc.fin, lieu: bc.lieu, plannedQty, realizedQty, status };
+      }),
+    [bcs, compareLines, params]
+  );
+
+  const dashboard = useMemo(
+    () => ({
+      bcCount: bcs.length,
+      lineCount: compareLines.length,
+      overCount: compareLines.filter((l) => l.status === "DEPASSE").length,
+      alertCount: compareLines.filter((l) => l.status === "A SURVEILLER").length,
+      rowsNoBc: rowsWithoutBc.length,
+      importedCount: importRows.length,
+    }),
+    [bcs, compareLines, rowsWithoutBc, importRows]
+  );
+
+  const filteredCompareLines = useMemo(() => {
+    const q = normalizeText(searchCompare);
+    if (!q) return compareLines;
+    return compareLines.filter((l) =>
+      normalizeText([l.bc, l.code, l.libelle, l.libelleReference, l.lieu, l.status].join(" ")).includes(q)
+    );
+  }, [compareLines, searchCompare]);
+
+  const filteredBcs = useMemo(() => {
+    const q = normalizeText(searchBc);
+    if (!q) return bcs;
+    return bcs.filter((bc) => normalizeText([bc.id, bc.lieu, bc.sourceName].join(" ")).includes(q));
+  }, [bcs, searchBc]);
+
+  const filteredImportRows = useMemo(() => {
+    const q = normalizeText(searchImport);
+    if (!q) return importRows;
+    return importRows.filter((r) =>
+      normalizeText(
+        [r.date, r.numBon, r.description, r.bcValide, r.numBonManuelBrut, r.codeAuto, r.chantier, r.exutoire, r.assignedBc].join(" ")
+      ).includes(q)
+    );
+  }, [importRows, searchImport]);
+
+  const filteredRowsWithoutBc = useMemo(() => {
+    const q = normalizeText(searchSansBc);
+    if (!q) return rowsWithoutBc;
+    return rowsWithoutBc.filter((r) =>
+      normalizeText([r.date, r.numBon, r.description, r.chantier, r.exutoire, r.simulationBc, r.simulationCode].join(" ")).includes(q)
+    );
+  }, [rowsWithoutBc, searchSansBc]);
+
+  const selectedBc = useMemo(() => bcs.find((b) => b.uid === selectedBcUid) || null, [bcs, selectedBcUid]);
+
+  const simulationRows = useMemo(() => {
+    return filteredRowsWithoutBc.map((row) => {
+      const simBc = normalizeBC(row.simulationBc);
+      const targetBc = bcs.find((b) => normalizeBC(b.id) === simBc);
+      const targetLine =
+        targetBc?.lines.find((l) => normalizeCode(l.code || getResolvedBcLine(l, mappings).code) === normalizeCode(row.simulationCode)) || null;
+      const targetResolved = targetLine ? getResolvedBcLine(targetLine, mappings) : null;
+      const planned = parseNumber(targetLine?.qtePrevue);
+      const already = effectiveImportRows
+        .filter((r) => normalizeBC(r.effectiveBc) === simBc && normalizeCode(r.effectiveCode || r.codeAuto) === normalizeCode(targetResolved?.code || row.simulationCode))
+        .reduce((s, r) => s + parseNumber(r.quantite), 0);
+      const after = already + parseNumber(row.quantite);
+      const status = !simBc
+        ? "BC simulé manquant"
+        : !targetLine
+        ? "BC/code introuvable"
+        : statusFromValues(after, planned, targetBc?.fin, params).replace("DEPASSE", "DEPASSERA");
+      return { row, targetBc, targetLine, planned, already, after, status };
+    });
+  }, [filteredRowsWithoutBc, bcs, effectiveImportRows, mappings, params]);
+
+  async function handlePdfUpload(event) {
+    const files = Array.from(event.target.files || []);
+    if (!files.length) return;
+    setParsingPdf(true);
+    try {
+      const parsed = [];
+      for (const file of files) {
+        const text = await extractPdfText(file);
+        parsed.push(parsePdfToBc(text, file.name, mappings));
+      }
+      setBcs((prev) => [...prev, ...parsed]);
+      if (!selectedBcUid && parsed[0]) setSelectedBcUid(parsed[0].uid);
+    } catch (e) {
+      alert("Erreur lecture PDF : " + (e?.message || e));
+    } finally {
+      setParsingPdf(false);
+      event.target.value = "";
+    }
+  }
+
+  async function handleXlsUpload(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const data = await file.arrayBuffer();
+      const wb = XLSX.read(data, { type: "array", cellDates: true });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      const built = buildImportRows(rows, mappings);
+      setImportRows(built);
+      setXlsInfo(`${built.length} ligne(s) importée(s) depuis ${file.name}`);
+    } catch (e) {
+      alert("Erreur import XLS : " + (e?.message || e));
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  function createEmptyBc() {
+    const next = hydrateBc({
+      id: "",
+      emission: "",
+      debut: "",
+      fin: "",
+      lieu: "",
+      sourceName: "Saisie manuelle",
+      rawText: "",
+      lines: [hydrateBcLine({})],
+    });
+    setBcs((prev) => [next, ...prev]);
+    setSelectedBcUid(next.uid);
+  }
+
+  function createBcFromPastedText() {
+    if (!rawPasteText.trim()) return;
+    const bc = parsePdfToBc(rawPasteText, "Texte colle", mappings);
+    setBcs((prev) => [bc, ...prev]);
+    setSelectedBcUid(bc.uid);
+    setRawPasteText("");
+  }
+
+  function updateBcField(bcUid, field, value) {
+    setBcs((prev) =>
+      prev.map((bc) => (bc.uid === bcUid ? { ...bc, [field]: field === "id" ? normalizeBC(value) : value } : bc))
+    );
+  }
+
+  function addBcLine(bcUid) {
+    setBcs((prev) => prev.map((bc) => (bc.uid === bcUid ? { ...bc, lines: [...bc.lines, hydrateBcLine({})] } : bc)));
+  }
+
+  function updateBcLine(bcUid, lineUid, field, value) {
+    setBcs((prev) =>
+      prev.map((bc) => {
+        if (bc.uid !== bcUid) return bc;
+        return {
+          ...bc,
+          lines: bc.lines.map((line) => {
+            if (line.uid !== lineUid) return line;
+            const next = { ...line, [field]: ["qtePrevue", "prix", "montant"].includes(field) ? parseNumber(value) : value };
+            if (field === "libelle" && !next.code) {
+              const map = findBestMapping(next.libelle, mappings);
+              next.code = next.code || map.code;
+              next.unite = next.unite || map.unite;
+              next.libelleReference = next.libelleReference || map.libelleReference;
+            }
+            if (field === "qtePrevue" || field === "prix") next.montant = parseNumber(next.qtePrevue) * parseNumber(next.prix);
+            return next;
+          }),
+        };
+      })
+    );
+  }
+
+  function deleteBcLine(bcUid, lineUid) {
+    setBcs((prev) =>
+      prev.map((bc) => {
+        if (bc.uid !== bcUid) return bc;
+        const lines = bc.lines.filter((l) => l.uid !== lineUid);
+        return { ...bc, lines: lines.length ? lines : [hydrateBcLine({})] };
+      })
+    );
+  }
+
+  function duplicateSelectedBc() {
+    if (!selectedBc) return;
+    const copy = hydrateBc({ ...selectedBc, uid: uid(), id: selectedBc.id ? `${selectedBc.id}-COPIE` : "", lines: selectedBc.lines.map((line) => ({ ...line, uid: uid() })) });
+    setBcs((prev) => [copy, ...prev]);
+    setSelectedBcUid(copy.uid);
+  }
+
+  function deleteSelectedBc() {
+    if (!selectedBc) return;
+    if (!window.confirm(`Supprimer le BC ${selectedBc.id || "sans numéro"} ?`)) return;
+    setBcs((prev) => prev.filter((bc) => bc.uid !== selectedBc.uid));
+  }
+
+  function updateImportRow(rowUid, field, value) {
+    setImportRows((prev) =>
+      prev.map((r) => {
+        if (r.uid !== rowUid) return r;
+        const next = { ...r };
+        if (field === "date") next[field] = excelDateToIso(value);
+        else if (["quantite", "montant"].includes(field)) next[field] = parseNumber(value);
+        else if (["bcValide", "assignedBc", "simulationBc"].includes(field)) next[field] = normalizeBC(value);
+        else next[field] = value;
+        next.chantierExutoire = [next.chantier, next.exutoire].filter(Boolean).join(" | ");
+        return next;
+      })
+    );
+  }
+
+  function applyAutoMappingToRow(rowUid) {
+    setImportRows((prev) =>
+      prev.map((r) => {
+        if (r.uid !== rowUid) return r;
+        const map = findBestMapping(r.description, mappings);
+        return {
+          ...r,
+          codeAuto: map.code,
+          libelleReferenceAuto: map.libelleReference,
+          unite: map.unite || r.unite,
+          simulationCode: r.simulationCode || map.code,
+        };
+      })
+    );
+  }
+
+  function affectSimulation(rowUid) {
+    setImportRows((prev) =>
+      prev.map((r) => (r.uid === rowUid ? { ...r, assignedBc: normalizeBC(r.simulationBc), assignedCode: r.simulationCode || r.codeAuto } : r))
+    );
+  }
+
+  function clearAffectation(rowUid) {
+    setImportRows((prev) => prev.map((r) => (r.uid === rowUid ? { ...r, assignedBc: "", assignedCode: "" } : r)));
+  }
+
+  function refreshMappingsOnImports() {
+    setImportRows((prev) =>
+      prev.map((r) => {
+        const map = findBestMapping(r.description, mappings);
+        return {
+          ...r,
+          codeAuto: map.code,
+          libelleReferenceAuto: map.libelleReference,
+          unite: map.unite || r.unite,
+          simulationCode: r.simulationCode || map.code,
+        };
+      })
+    );
+  }
+
+  function addMapping() {
+    setMappings((prev) => [...prev, { uid: uid(), keyword: "", code: "", libelleReference: "", unite: "", active: true }]);
+  }
+
+  function updateMapping(mappingUid, field, value) {
+    setMappings((prev) => prev.map((m) => (m.uid === mappingUid ? { ...m, [field]: value } : m)));
+  }
+
+  function removeMapping(mappingUid) {
+    setMappings((prev) => prev.filter((m) => m.uid !== mappingUid));
+  }
+
+  function downloadJson() {
+    const blob = new Blob([JSON.stringify({ version: 4, bcs, importRows, mappings, params }, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "suivi_bdc.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function loadJson(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const hydrated = {
+        bcs: (parsed.bcs || []).map(hydrateBc),
+        importRows: (parsed.importRows || []).map(hydrateImportRow),
+        mappings: (parsed.mappings || defaultMappings).map((m) => ({
+          uid: m.uid || uid(),
+          keyword: m.keyword || "",
+          code: m.code || "",
+          libelleReference: m.libelleReference || "",
+          unite: m.unite || "",
+          active: m.active !== false,
+        })),
+        params: { ...defaultState.params, ...(parsed.params || {}) },
+      };
+      setBcs(hydrated.bcs);
+      setImportRows(hydrated.importRows);
+      setMappings(hydrated.mappings);
+      setParams(hydrated.params);
+      setSelectedBcUid(hydrated.bcs?.[0]?.uid || null);
+    } catch {
+      alert("Fichier JSON invalide");
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  function resetAll() {
+    if (!window.confirm("Réinitialiser toutes les données ?")) return;
+    setBcs([]);
+    setImportRows([]);
+    setMappings(defaultMappings);
+    setParams(defaultState.params);
+    setSelectedBcUid(null);
+    setSearchCompare("");
+    setSearchBc("");
+    setSearchImport("");
+    setSearchSansBc("");
+    setRawPasteText("");
+    setXlsInfo("");
+  }
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div>
+          <h1>Suivi des bons de commande</h1>
+          <p>Version déployable Vercel : import XLS/PDF, BDC, comparatif, simulation, export Excel et sauvegarde JSON.</p>
+        </div>
+        <div className="actions">
+          <button className="btn primary" onClick={() => exportWorkbook({ bcs, importRows, mappings, params }, compareLines, compareByBc, rowsWithoutBc, simulationRows)}>
+            Exporter Excel complet
+          </button>
+          <button className="btn" onClick={downloadJson}>Sauvegarder JSON</button>
+          <label className="btn">
+            Charger JSON
+            <input type="file" accept=".json" hidden onChange={loadJson} />
+          </label>
+        </div>
+      </header>
+
+      <section className="kpis">
+        <div className="kpi"><div className="kpi-label">BC</div><div className="kpi-value">{dashboard.bcCount}</div></div>
+        <div className="kpi"><div className="kpi-label">Lignes BC</div><div className="kpi-value">{dashboard.lineCount}</div></div>
+        <div className="kpi"><div className="kpi-label">Lignes importées</div><div className="kpi-value">{dashboard.importedCount}</div></div>
+        <div className="kpi"><div className="kpi-label">Sans BC</div><div className="kpi-value">{dashboard.rowsNoBc}</div></div>
+        <div className="kpi"><div className="kpi-label">À surveiller</div><div className="kpi-value">{dashboard.alertCount}</div></div>
+        <div className="kpi"><div className="kpi-label">Dépassées</div><div className="kpi-value">{dashboard.overCount}</div></div>
+      </section>
+
+      <nav className="tabs">
+        {[
+          ["dashboard", "Tableau de bord"],
+          ["bcs", "Bons de commande"],
+          ["compare", "Comparatif"],
+          ["import", "Import XLS"],
+          ["sansbc", "Lignes sans BC"],
+          ["mapping", "Correspondance"],
+          ["settings", "Paramètres"],
+        ].map(([key, label]) => (
+          <button key={key} className={`tab ${activeTab === key ? "active" : ""}`} onClick={() => setActiveTab(key)}>{label}</button>
+        ))}
+      </nav>
+
+      {activeTab === "dashboard" && (
+        <div className="grid-2">
+          <Panel title="Synthèse par BC">
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>BC</th><th>Lieu</th><th>Début</th><th>Fin</th><th>Prévu</th><th>Réalisé</th><th>Statut</th></tr>
+                </thead>
+                <tbody>
+                  {compareByBc.map((row) => (
+                    <tr key={row.uid}>
+                      <td>{row.id || "—"}</td>
+                      <td>{row.lieu || "—"}</td>
+                      <td>{formatDate(row.debut)}</td>
+                      <td>{formatDate(row.fin)}</td>
+                      <td>{formatNumber(row.plannedQty)}</td>
+                      <td>{formatNumber(row.realizedQty)}</td>
+                      <td><span className={kpiClass(row.status)}>{row.status}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+
+          <Panel title="Alertes">
+            <div className="stack">
+              {compareLines.filter((l) => l.status === "DEPASSE" || l.status === "A SURVEILLER").slice(0, 10).map((l, i) => (
+                <div key={i} className="alert-box">
+                  <div className="row-between">
+                    <div>
+                      <strong>{l.bc || "BC non renseigné"} — {l.code || l.libelle}</strong>
+                      <div className="muted">{l.lieu || "Lieu non renseigné"}</div>
+                    </div>
+                    <span className={kpiClass(l.status)}>{l.status}</span>
+                  </div>
+                  <div className="muted">Réalisé {formatNumber(l.realizedQty)} / Prévu {formatNumber(l.plannedQty)} {l.unite}</div>
+                </div>
+              ))}
+              {!compareLines.some((l) => l.status === "DEPASSE" || l.status === "A SURVEILLER") && <div className="empty">Aucune alerte pour le moment.</div>}
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {activeTab === "bcs" && (
+        <div className="grid-bcs">
+          <Panel title="Importer / créer des BDC">
+            <div className="stack">
+              <label className="btn primary">Importer PDF<input type="file" accept=".pdf" multiple hidden onChange={handlePdfUpload} /></label>
+              <button className="btn" onClick={createEmptyBc}>Nouveau BC manuel</button>
+              <button className="btn" onClick={duplicateSelectedBc} disabled={!selectedBc}>Dupliquer le BC</button>
+              <button className="btn danger" onClick={deleteSelectedBc} disabled={!selectedBc}>Supprimer le BC</button>
+
+              <div className="box">
+                <label className="label">Créer depuis texte collé</label>
+                <textarea className="textarea" value={rawPasteText} onChange={(e) => setRawPasteText(e.target.value)} placeholder="Colle ici le texte extrait d’un PDF..." />
+                <button className="btn" onClick={createBcFromPastedText}>Créer un BC depuis le texte</button>
+              </div>
+
+              <div className="box">
+                <label className="label">Rechercher un BC</label>
+                <input className="input" value={searchBc} onChange={(e) => setSearchBc(e.target.value)} placeholder="Numéro, lieu, source..." />
+                <div className="list-scroll">
+                  {filteredBcs.map((bc) => (
+                    <button key={bc.uid} className={`list-item ${selectedBcUid === bc.uid ? "selected" : ""}`} onClick={() => setSelectedBcUid(bc.uid)}>
+                      <strong>{bc.id || "BC sans numéro"}</strong>
+                      <div className="muted">{bc.lieu || "Lieu non renseigné"}</div>
+                      <div className="muted">{bc.lines.length} ligne(s)</div>
+                    </button>
+                  ))}
+                  {!filteredBcs.length && <div className="empty">Aucun BDC chargé.</div>}
+                </div>
+              </div>
+            </div>
+          </Panel>
+
+          <Panel title="Édition du BDC">
+            {!selectedBc ? (
+              <div className="empty">Sélectionne un BC ou crée-en un.</div>
+            ) : (
+              <div className="stack">
+                <div className="form-grid">
+                  <div><label className="label">Numéro BC</label><input className="input" value={selectedBc.id} onChange={(e) => updateBcField(selectedBc.uid, "id", e.target.value)} /></div>
+                  <div><label className="label">Date d’émission</label><input className="input" type="date" value={selectedBc.emission || ""} onChange={(e) => updateBcField(selectedBc.uid, "emission", e.target.value)} /></div>
+                  <div><label className="label">Date de début</label><input className="input" type="date" value={selectedBc.debut || ""} onChange={(e) => updateBcField(selectedBc.uid, "debut", e.target.value)} /></div>
+                  <div><label className="label">Date de fin</label><input className="input" type="date" value={selectedBc.fin || ""} onChange={(e) => updateBcField(selectedBc.uid, "fin", e.target.value)} /></div>
+                  <div><label className="label">Lieu d’exécution</label><input className="input" value={selectedBc.lieu || ""} onChange={(e) => updateBcField(selectedBc.uid, "lieu", e.target.value)} /></div>
+                  <div><label className="label">Source</label><input className="input" value={selectedBc.sourceName || ""} onChange={(e) => updateBcField(selectedBc.uid, "sourceName", e.target.value)} /></div>
+                </div>
+
+                <div className="row-between">
+                  <strong>Lignes du BDC</strong>
+                  <button className="btn" onClick={() => addBcLine(selectedBc.uid)}>Ajouter une ligne</button>
+                </div>
+
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr><th>Code</th><th>Libellé logiciel</th><th>Libellé BC référence</th><th>Unité</th><th>Qté prévue</th><th>Prix</th><th>Montant</th><th></th></tr>
+                    </thead>
+                    <tbody>
+                      {selectedBc.lines.map((line) => (
+                        <tr key={line.uid}>
+                          <td><input className="input" value={line.code || ""} onChange={(e) => updateBcLine(selectedBc.uid, line.uid, "code", e.target.value)} /></td>
+                          <td><input className="input" value={line.libelle || ""} onChange={(e) => updateBcLine(selectedBc.uid, line.uid, "libelle", e.target.value)} /></td>
+                          <td><input className="input" value={line.libelleReference || ""} onChange={(e) => updateBcLine(selectedBc.uid, line.uid, "libelleReference", e.target.value)} /></td>
+                          <td><input className="input" value={line.unite || ""} onChange={(e) => updateBcLine(selectedBc.uid, line.uid, "unite", e.target.value)} /></td>
+                          <td><input className="input" value={line.qtePrevue ?? 0} onChange={(e) => updateBcLine(selectedBc.uid, line.uid, "qtePrevue", e.target.value)} /></td>
+                          <td><input className="input" value={line.prix ?? 0} onChange={(e) => updateBcLine(selectedBc.uid, line.uid, "prix", e.target.value)} /></td>
+                          <td>{formatCurrency(line.montant)}</td>
+                          <td><button className="btn danger small" onClick={() => deleteBcLine(selectedBc.uid, line.uid)}>Supprimer</button></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="box">
+                  <label className="label">Texte brut du PDF</label>
+                  <textarea className="textarea" value={selectedBc.rawText || ""} onChange={(e) => updateBcField(selectedBc.uid, "rawText", e.target.value)} />
+                </div>
+              </div>
+            )}
+            {parsingPdf && <div className="muted">Lecture des PDF en cours…</div>}
+          </Panel>
+        </div>
+      )}
+
+      {activeTab === "compare" && (
+        <Panel title="Comparatif prévu / réalisé">
+          <div className="search-row">
+            <input className="input" value={searchCompare} onChange={(e) => setSearchCompare(e.target.value)} placeholder="Rechercher BC, code, libellé, référence, lieu..." />
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>BC</th><th>Lieu</th><th>Code</th><th>Libellé</th><th>Référence BC</th><th>Prévu</th><th>Réalisé</th><th>Reste</th><th>Montant prévu</th><th>Montant réalisé</th><th>Statut</th></tr>
+              </thead>
+              <tbody>
+                {filteredCompareLines.map((line, idx) => (
+                  <tr key={idx}>
+                    <td>{line.bc || "—"}</td>
+                    <td>{line.lieu || "—"}</td>
+                    <td>{line.code || "—"}</td>
+                    <td>{line.libelle}</td>
+                    <td>{line.libelleReference || "—"}</td>
+                    <td>{formatNumber(line.plannedQty)} {line.unite}</td>
+                    <td>{formatNumber(line.realizedQty)} {line.unite}</td>
+                    <td>{formatNumber(line.remainingQty)} {line.unite}</td>
+                    <td>{formatCurrency(line.plannedAmount)}</td>
+                    <td>{formatCurrency(line.realizedAmount)}</td>
+                    <td><span className={kpiClass(line.status)}>{line.status}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      )}
+
+      {activeTab === "import" && (
+        <Panel title="Import de l’export métier">
+          <div className="actions">
+            <label className="btn primary">Importer XLS / XLSX<input type="file" accept=".xls,.xlsx,.xlsm,.csv" hidden onChange={handleXlsUpload} /></label>
+            <button className="btn" onClick={refreshMappingsOnImports}>Recalculer les codes auto</button>
+          </div>
+          {xlsInfo && <div className="info">{xlsInfo}</div>}
+
+          <div className="mini-kpis">
+            <div className="mini-kpi"><div>Lignes importées</div><strong>{importRows.length}</strong></div>
+            <div className="mini-kpi"><div>BC valides</div><strong>{importRows.filter((r) => r.bcValide).length}</strong></div>
+            <div className="mini-kpi"><div>Sans BC</div><strong>{rowsWithoutBc.length}</strong></div>
+            <div className="mini-kpi"><div>Affectées manuellement</div><strong>{importRows.filter((r) => r.assignedBc).length}</strong></div>
+          </div>
+
+          <div className="search-row">
+            <input className="input" value={searchImport} onChange={(e) => setSearchImport(e.target.value)} placeholder="Rechercher date, num bon, libellé, BC, chantier..." />
+          </div>
+
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Num bon</th>
+                  <th>BC valide</th>
+                  <th>BC brut</th>
+                  <th>Description</th>
+                  <th>Code auto</th>
+                  <th>Référence</th>
+                  <th>Unité</th>
+                  <th>Qté</th>
+                  <th>Montant</th>
+                  <th>Chantier</th>
+                  <th>Exutoire</th>
+                  <th>BC affecté</th>
+                  <th>Code affecté</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredImportRows.slice(0, 500).map((row) => (
+                  <tr key={row.uid}>
+                    <td><input className="input" type="date" value={row.date || ""} onChange={(e) => updateImportRow(row.uid, "date", e.target.value)} /></td>
+                    <td><input className="input" value={row.numBon || ""} onChange={(e) => updateImportRow(row.uid, "numBon", e.target.value)} /></td>
+                    <td><input className="input" value={row.bcValide || ""} onChange={(e) => updateImportRow(row.uid, "bcValide", e.target.value)} /></td>
+                    <td><input className="input" value={row.numBonManuelBrut || ""} onChange={(e) => updateImportRow(row.uid, "numBonManuelBrut", e.target.value)} /></td>
+                    <td><input className="input" value={row.description || ""} onChange={(e) => updateImportRow(row.uid, "description", e.target.value)} /></td>
+                    <td><input className="input" value={row.codeAuto || ""} onChange={(e) => updateImportRow(row.uid, "codeAuto", e.target.value)} /></td>
+                    <td><input className="input" value={row.libelleReferenceAuto || ""} onChange={(e) => updateImportRow(row.uid, "libelleReferenceAuto", e.target.value)} /></td>
+                    <td><input className="input" value={row.unite || ""} onChange={(e) => updateImportRow(row.uid, "unite", e.target.value)} /></td>
+                    <td><input className="input" value={row.quantite ?? 0} onChange={(e) => updateImportRow(row.uid, "quantite", e.target.value)} /></td>
+                    <td><input className="input" value={row.montant ?? 0} onChange={(e) => updateImportRow(row.uid, "montant", e.target.value)} /></td>
+                    <td><input className="input" value={row.chantier || ""} onChange={(e) => updateImportRow(row.uid, "chantier", e.target.value)} /></td>
+                    <td><input className="input" value={row.exutoire || ""} onChange={(e) => updateImportRow(row.uid, "exutoire", e.target.value)} /></td>
+                    <td><input className="input" value={row.assignedBc || ""} onChange={(e) => updateImportRow(row.uid, "assignedBc", e.target.value)} /></td>
+                    <td><input className="input" value={row.assignedCode || ""} onChange={(e) => updateImportRow(row.uid, "assignedCode", e.target.value)} /></td>
+                    <td><button className="btn small" onClick={() => applyAutoMappingToRow(row.uid)}>Auto</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      )}
+
+      {activeTab === "sansbc" && (
+        <Panel title="Simulation d’attribution des lignes sans BC">
+          <div className="search-row">
+            <input className="input" value={searchSansBc} onChange={(e) => setSearchSansBc(e.target.value)} placeholder="Rechercher date, num bon, libellé, chantier..." />
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Date</th><th>Description</th><th>Qté</th><th>Chantier</th><th>Exutoire</th><th>BC simulé</th><th>Code simulé</th><th>Prévu BC</th><th>Déjà réalisé</th><th>Après affectation</th><th>Statut</th><th></th></tr>
+              </thead>
+              <tbody>
+                {simulationRows.map(({ row, targetBc, targetLine, planned, already, after, status }) => (
+                  <tr key={row.uid}>
+                    <td>{formatDate(row.date)}</td>
+                    <td><strong>{row.description}</strong><div className="muted">BC brut : {row.numBonManuelBrut || "vide"}</div></td>
+                    <td>{formatNumber(row.quantite)} {row.unite}</td>
+                    <td>{row.chantier || "—"}</td>
+                    <td>{row.exutoire || "—"}</td>
+                    <td>
+                      <select className="input" value={row.simulationBc || ""} onChange={(e) => updateImportRow(row.uid, "simulationBc", e.target.value)}>
+                        <option value="">Choisir un BC</option>
+                        {bcs.map((bc) => <option key={bc.uid} value={bc.id}>{bc.id || "BC sans numéro"}</option>)}
+                      </select>
+                    </td>
+                    <td>
+                      <select className="input" value={row.simulationCode || ""} onChange={(e) => updateImportRow(row.uid, "simulationCode", e.target.value)}>
+                        <option value="">Choisir un code</option>
+                        {(targetBc?.lines || []).map((line) => {
+                          const resolved = getResolvedBcLine(line, mappings);
+                          return <option key={line.uid} value={resolved.code}>{resolved.code || line.libelle}</option>;
+                        })}
+                      </select>
+                    </td>
+                    <td>{targetLine ? `${formatNumber(planned)} ${targetLine.unite}` : "—"}</td>
+                    <td>{targetLine ? `${formatNumber(already)} ${targetLine.unite}` : "—"}</td>
+                    <td>{targetLine ? `${formatNumber(after)} ${targetLine.unite}` : "—"}</td>
+                    <td><span className={kpiClass(status)}>{status}</span></td>
+                    <td>
+                      <div className="actions">
+                        <button className="btn small" disabled={!targetLine || !row.simulationBc} onClick={() => affectSimulation(row.uid)}>Affecter</button>
+                        <button className="btn small" onClick={() => clearAffectation(row.uid)}>Effacer</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      )}
+
+      {activeTab === "mapping" && (
+        <Panel title="Table de correspondance libellé → code BC">
+          <div className="actions">
+            <button className="btn" onClick={addMapping}>Ajouter une règle</button>
+            <button className="btn" onClick={refreshMappingsOnImports}>Appliquer aux imports</button>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Libellé logiciel</th><th>Code correspondance</th><th>Libellé BC référence</th><th>Unité</th><th>Actif</th><th></th></tr></thead>
+              <tbody>
+                {mappings.map((m) => (
+                  <tr key={m.uid}>
+                    <td><input className="input" value={m.keyword} onChange={(e) => updateMapping(m.uid, "keyword", e.target.value)} /></td>
+                    <td><input className="input" value={m.code} onChange={(e) => updateMapping(m.uid, "code", e.target.value)} /></td>
+                    <td><input className="input" value={m.libelleReference} onChange={(e) => updateMapping(m.uid, "libelleReference", e.target.value)} /></td>
+                    <td><input className="input" value={m.unite} onChange={(e) => updateMapping(m.uid, "unite", e.target.value)} /></td>
+                    <td><input type="checkbox" checked={!!m.active} onChange={(e) => updateMapping(m.uid, "active", e.target.checked)} /></td>
+                    <td><button className="btn danger small" onClick={() => removeMapping(m.uid)}>Supprimer</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      )}
+
+      {activeTab === "settings" && (
+        <div className="grid-2">
+          <Panel title="Paramètres">
+            <div className="stack">
+              <div>
+                <label className="label">Seuil d’alerte (0,9 = 90%)</label>
+                <input className="input" value={params.alertThreshold} onChange={(e) => setParams((p) => ({ ...p, alertThreshold: parseNumber(e.target.value) || 0.9 }))} />
+              </div>
+              <div>
+                <label className="label">Jours avant fin = échéance proche</label>
+                <input className="input" value={params.daysBeforeEnd} onChange={(e) => setParams((p) => ({ ...p, daysBeforeEnd: Math.max(0, Math.round(parseNumber(e.target.value))) }))} />
+              </div>
+              <label className="checkbox-line">
+                <input type="checkbox" checked={!!params.excludeValdelia} onChange={(e) => setParams((p) => ({ ...p, excludeValdelia: e.target.checked }))} />
+                Exclure les chantiers Valdelia des lignes sans BC
+              </label>
+            </div>
+          </Panel>
+
+          <Panel title="Maintenance des données">
+            <div className="stack">
+              <div className="box">
+                <strong>Correctifs appliqués</strong>
+                <ul>
+                  <li>Dates stabilisées.</li>
+                  <li>Comparatif basé sur BC exact + code exact + nature de ligne.</li>
+                  <li>Num bon, chantier et exutoire séparés dans l’import.</li>
+                  <li>Lignes importées modifiables directement dans l’app.</li>
+                  <li>Export Excel complet de tous les tableaux.</li>
+                  <li>JSON réimporté avec structure stable.</li>
+                </ul>
+              </div>
+              <button className="btn danger" onClick={resetAll}>Réinitialiser l’application</button>
+            </div>
+          </Panel>
+        </div>
+      )}
+    </div>
+  );
+}
